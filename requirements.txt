@@ -3,3 +3,6 @@ bs4
 pymupdf
 docling
 tqdm
+pymupdf4llm
+pymupdf-layout
+llama-index
