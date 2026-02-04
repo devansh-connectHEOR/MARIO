@@ -1,1 +1,5 @@
+.env
 *.pdf
+*.md
+*.png
+*.txt

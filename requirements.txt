@@ -6,3 +6,15 @@ tqdm
 pymupdf4llm
 pymupdf-layout
 llama-index
+pytesseract 
+opencv-python
+langchain-docling
+langchain-google-genai
+langchain-openai
+faiss-cpu
+langchain-community
+pypdf
+pikepdf
+nltk
+unstructured
+rank_bm25
