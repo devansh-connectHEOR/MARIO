@@ -1,5 +1,12 @@
 from nltk import word_tokenize, pos_tag, ne_chunk
+import re
+from pathlib import Path
+from tqdm import tqdm
+import os
+import fitz
 
+#---Metadata Correction Functions---
+#
 def is_person_nltk(text):
     try:
         tokens = word_tokenize(text)
@@ -12,8 +19,6 @@ def is_person_nltk(text):
         return False
     except Exception:
         return False
-
-import re
 
 def clean_text(text):
     pattern = r'[^a-zA-Z\s\.\-]'
@@ -49,3 +54,24 @@ def extract_authors(page_0: list[str]) -> list[str]:
         authors_flag = []
 
     return authors
+
+def set_title_author(input: Path, output: Path) -> str:
+    if not os.path.exists(output):
+        os.makedir(output)
+        print(f"Created folder: {output}")
+    else: print(f"Output folder exists")
+    print("Extracting title from the file name and authors from the first page and setting them as meta data")
+    for filename in tqdm(os.listdir(input)):
+        file_path = input / filename
+        doc = fitz.open(file_path)
+        page_0 = doc.load_page(0).get_text().split('\n')
+        authors = extract_authors(page_0)
+        new_metadata = {
+            "title": filename.split('.pdf')[0],
+            'authors': ",".join(authors)
+        }
+        doc.set_metadata(new_metadata)
+        doc.save(output / filename)
+        doc.close()
+    print("Updating metadata completed")
+
