@@ -13,6 +13,12 @@ from docling.document_converter import PdfFormatOption
 from docling.document_converter import ConversionResult
 import fitz
 from PIL import Image
+import base64
+
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.documents import Document
+from langchain_community.vectorstores import FAISS
+from langchain_text_splitters.base import TextSplitter
 
 pipeline_options = PdfPipelineOptions()
 
@@ -33,29 +39,27 @@ def read_documents_from_directory(input_path: Path, converter: DocumentConverter
             pbar = tqdm(entries, dynamic_ncols=True, unit="doc", desc="Loading docs", leave=True)
             for entry in pbar:
                 if entry.is_file():
-                    pbar.set_description(f"Working on {entry}")
-                    file_path = input / entry
-                    d = fitz(file_path)
+                    file_path = input_path / entry
+                    d = fitz.open(file_path)
                     meta = d.metadata
-                    metadata = f"{meta['title']} | {meta['authors']} | TSD"
+                    metadata = f"{meta['title']} | {meta['author']} | TSD"
                     doc = (converter.convert(file_path), metadata)
                     dox.append(doc)
                     i+=1
         print(f"Read {i} documents")
         return dox
 
-def read_documents_from_list(input_paths: list[Path], converter: DocumentConverter = default_converter) -> list[tuple[ConversionResult, str]]
+def read_documents_from_list(input_paths: list[Path], converter: DocumentConverter = default_converter) -> list[tuple[ConversionResult, str]]:
         print(f"Reading files")
         dox = []
         i = 0
         pbar = tqdm(input_paths, dynamic_ncols=True, unit="doc", desc="Loading docs", leave=True)
         for entry in pbar:
             if entry.is_file():
-                pbar.set_description(f"Working on {entry}")
-                file_path = input / entry
-                d = fitz(file_path)
+                file_path = entry
+                d = fitz.open(file_path)
                 meta = d.metadata
-                metadata = f"{meta['title']} | {meta['authors']} | TSD"
+                metadata = f"{meta['title']} | {meta['author']} | TSD"
                 doc = (converter.convert(file_path), metadata)
                 dox.append(doc)
                 i+=1
@@ -74,8 +78,8 @@ def read_documents(input_path: Path | list[Path], converter: DocumentConverter =
 
 def extract_markdown_images(docs: list[(ConversionResult, str)], 
                             markdown_path: Path, 
-                            images_path: Path) -> bool:
-        img_metadata = ["Image Path | Document | Document Type | Page Number | Caption"]
+                            images_path: Path):
+        img_metadata = ["Image Name | Document | Document Type | Page Number | Caption"]
         doc_metadata = ["Document Title | Authors | Document Type"]
 
         pbar = tqdm(docs, dynamic_ncols=True, unit="doc", desc="Extracting data", leave=True)
@@ -85,7 +89,7 @@ def extract_markdown_images(docs: list[(ConversionResult, str)],
              mkd = doc.document.export_to_markdown()
              output_file = markdown_path / f"{title}.md"
              output_file.write_text(mkd, encoding="utf-8")
-             doc_metadata += meta
+             doc_metadata.append(meta)
 
              for i, img in enumerate(doc.document.pictures):
                 i += 1
@@ -103,10 +107,66 @@ def extract_markdown_images(docs: list[(ConversionResult, str)],
                                 caption = text
                                 break
                 if not caption: caption = "Caption not found"
-                img_metadata.append(f"{image_filename} | {title} | {doc_type} | {img.prov[0].page_no} | {caption}")
+                img_metadata.append(f"{image_filename.stem} | {title} | {doc_type} | {img.prov[0].page_no} | {caption}")
         with open(markdown_path / "metadata.txt", "w", encoding="utf-8") as f:
             f.write("\n".join(doc_metadata))
 
         with open(images_path / "metadata.txt", "w", encoding="utf-8") as f:
             f.write("\n".join(img_metadata))
+        
+        print(f"Extracted markdown saved to {markdown_path} and images saved to {images_path}")
+
+def load_data(markdown_path: Path = None, images_path: Path = None, splitter: TextSplitter = None) -> list[Document, Document, dict]:
+    mkd_docs = []
+    img_docs = []
+    imgs = {}
+    if markdown_path:
+        with open(markdown_path / "metadata.txt") as f:
+             metadata = f.read()
+             metadata = metadata.split('\n')[1:]
+             metadata = [i.split(' | ') for i in metadata]
+             metadata = {
+                  i[0]: {
+                       "title": i[0],
+                       "authors": i[1],
+                       "doc_type": i[2]
+                  }
+                  for i in metadata
+             }
+        
+        for mkd in tqdm(markdown_path.glob("*.md"), dynamic_ncols=True, unit="doc", desc="Loading docs", leave=True):
+            with open(mkd, mode = 'r', encoding = 'utf-8') as f:
+                content = f.read()
+                doc = splitter.split_text(content) if splitter else Document(content)
+                doc.metadata = metadata[mkd.stem]
+                mkd_docs.append(doc)
+    
+    if images_path:
+        with open(images_path / "metadata.txt") as f:
+             metadata = f.read()
+             metadata = metadata.split('\n')[1:]
+             metadata = [i.split(' | ') for i in metadata]
+             metadata = {
+                  i[0]: {
+                       "image": i[0],
+                       "document": i[1],
+                       "doc_type": i[2],
+                       "page_no": i[3],
+                       "caption": i[4]
+                  }
+                  for i in metadata
+             }
+        
+        for img in tqdm(images_path.glob("*.png"), dynamic_ncols=True, unit="doc", desc="Loading docs", leave=True):
+            with open(img, 'rb') as image_file:
+                encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
+                imgs[img.stem] = encoded_string
+            doc = Document(
+                 page_content = metadata[img.stem]['caption'],
+                 metadata = metadata[img.stem]
+            )
+            img_docs.append(doc)
+    
+    return mkd_docs, img_docs, imgs
+
 
