@@ -3,3 +3,6 @@
 *.md
 *.png
 *.txt
+*cpython*
+*.bin
+chroma*

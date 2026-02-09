@@ -127,6 +127,7 @@ def load_data(markdown_path: Path = None, images_path: Path = None, splitter: Te
              metadata = [i.split(' | ') for i in metadata]
              metadata = {
                   i[0]: {
+                       "type": "text",
                        "title": i[0],
                        "authors": i[1],
                        "doc_type": i[2]
@@ -137,9 +138,9 @@ def load_data(markdown_path: Path = None, images_path: Path = None, splitter: Te
         for mkd in tqdm(markdown_path.glob("*.md"), dynamic_ncols=True, unit="doc", desc="Loading docs", leave=True):
             with open(mkd, mode = 'r', encoding = 'utf-8') as f:
                 content = f.read()
-                doc = splitter.split_text(content) if splitter else Document(content)
-                doc.metadata = metadata[mkd.stem]
-                mkd_docs.append(doc)
+                docs = splitter.split_text(content) if splitter else [Document(content)]
+                for doc in docs: doc.metadata = metadata[mkd.stem]
+                mkd_docs += docs
     
     if images_path:
         with open(images_path / "metadata.txt") as f:
@@ -148,6 +149,7 @@ def load_data(markdown_path: Path = None, images_path: Path = None, splitter: Te
              metadata = [i.split(' | ') for i in metadata]
              metadata = {
                   i[0]: {
+                       "type": "image",
                        "image": i[0],
                        "document": i[1],
                        "doc_type": i[2],
@@ -168,5 +170,3 @@ def load_data(markdown_path: Path = None, images_path: Path = None, splitter: Te
             img_docs.append(doc)
     
     return mkd_docs, img_docs, imgs
-
-
