@@ -32,21 +32,8 @@ default_converter = DocumentConverter(
 )
 
 def read_documents_from_directory(input_path: Path, converter: DocumentConverter = default_converter) -> list[tuple[ConversionResult, str]]:
-        print(f"Reading files from directory {input}")
-        dox = []   
-        i = 0
-        with os.scandir(input_path) as entries:
-            pbar = tqdm(entries, dynamic_ncols=True, unit="doc", desc="Loading docs", leave=True)
-            for entry in pbar:
-                if entry.is_file():
-                    file_path = input_path / entry
-                    d = fitz.open(file_path)
-                    meta = d.metadata
-                    metadata = f"{meta['title']} | {meta['author']} | TSD"
-                    doc = (converter.convert(file_path), metadata)
-                    dox.append(doc)
-                    i+=1
-        print(f"Read {i} documents")
+        all_pdf_files = list(input_path.rglob("*.pdf"))
+        dox = read_documents_from_list(all_pdf_files, converter)
         return dox
 
 def read_documents_from_list(input_paths: list[Path], converter: DocumentConverter = default_converter) -> list[tuple[ConversionResult, str]]:
@@ -121,7 +108,7 @@ def load_data(markdown_path: Path = None, images_path: Path = None, splitter: Te
     img_docs = []
     imgs = {}
     if markdown_path:
-        with open(markdown_path / "metadata.txt") as f:
+        with open(markdown_path / "metadata.txt", mode = 'r', encoding = 'utf-8') as f:
              metadata = f.read()
              metadata = metadata.split('\n')[1:]
              metadata = [i.split(' | ') for i in metadata]
@@ -134,12 +121,13 @@ def load_data(markdown_path: Path = None, images_path: Path = None, splitter: Te
                   }
                   for i in metadata
              }
+        print(metadata)
         
         for mkd in tqdm(markdown_path.glob("*.md"), dynamic_ncols=True, unit="doc", desc="Loading docs", leave=True):
             with open(mkd, mode = 'r', encoding = 'utf-8') as f:
                 content = f.read()
                 docs = splitter.split_text(content) if splitter else [Document(content)]
-                for doc in docs: doc.metadata = metadata[mkd.stem]
+                for doc in docs: doc.metadata.update(metadata[mkd.stem])
                 mkd_docs += docs
     
     if images_path:
@@ -170,3 +158,4 @@ def load_data(markdown_path: Path = None, images_path: Path = None, splitter: Te
             img_docs.append(doc)
     
     return mkd_docs, img_docs, imgs
+
