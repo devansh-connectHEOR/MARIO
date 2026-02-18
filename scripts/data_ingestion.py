@@ -121,7 +121,6 @@ def load_data(markdown_path: Path = None, images_path: Path = None, splitter: Te
                   }
                   for i in metadata
              }
-        print(metadata)
         
         for mkd in tqdm(markdown_path.glob("*.md"), dynamic_ncols=True, unit="doc", desc="Loading docs", leave=True):
             with open(mkd, mode = 'r', encoding = 'utf-8') as f:
@@ -131,7 +130,7 @@ def load_data(markdown_path: Path = None, images_path: Path = None, splitter: Te
                 mkd_docs += docs
     
     if images_path:
-        with open(images_path / "metadata.txt") as f:
+        with open(images_path / "metadata.txt", mode = 'r', encoding= 'utf-8') as f:
              metadata = f.read()
              metadata = metadata.split('\n')[1:]
              metadata = [i.split(' | ') for i in metadata]
