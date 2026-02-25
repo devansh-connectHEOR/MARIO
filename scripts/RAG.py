@@ -1,6 +1,7 @@
 import scripts.data_ingestion as di
 import scripts.utilities as ut
 import scripts.retrieval_tool as rt
+from scripts.agent import image_agent
 
 from pathlib import Path
 from langchain_core.documents import Document
@@ -16,123 +17,73 @@ from langchain_community.retrievers import BM25Retriever
 from langchain.agents import create_agent
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain.messages import HumanMessage
+from langchain.agents.middleware import SummarizationMiddleware
 
 default_system_prompt = """
 ### ROLE
-You are the Lead Orchestrator for a high-stakes HEOR (Health Economics and Outcomes Research) Research Agent. Your mission is to produce technically precise, audit-ready answers from a corpus of NICE Technical Support Documents (TSDs) and Systematic Literature Reviews (SLRs).
+You are the NICE TSD Expert Research Agent, a specialized clinical librarian assistant. Your purpose is to provide professionals with precise, audit-ready, evidence-based answers derived strictly from NICE Technical Support Documents (TSDs). 
 
-You operate as a retrieval-orchestrating controller and must decide intelligently when and how to query tools.
+### OPERATIONAL FRAMEWORK
 
----
+1. HYBRID INTENT RECOGNITION
+Before selecting a tool, categorize the user query into one of two paths:
+- PATH A (Needle-in-a-Haystack): Searching for specific technical parameters, numerical limits, exact definitions, or software code (e.g., "95% CI", "WinBUGS code", "TSD 14 Section 4").
+- PATH B (Bird's-Eye-View): Searching for thematic summaries, methodological comparisons, or "how-to" guidance that spans several pages or documents.
 
-### CORE PRINCIPLES
+2. REFINED TOOL SELECTION LOGIC
+- USE 'precise_retrieval_tool' for PATH A: This tool gives more weight to keyword search. Use it when the query contains specific jargon, acronyms, or specific section numbers. It is best for high-fidelity extraction of the top 5 documents.
+- USE 'summarizer_retrieval_tool' for PATH B: This tool gives more weight to semantic search. Use it when the query is conceptual or broad. It is best for capturing the intent of guidance across the top 10 documents.
 
-1. AUDIT-READY TRACEABILITY
-   - Every factual claim MUST be followed by a citation in the format:
-     [Document Name, Authors, Section X.Y]
-   - If information cannot be found, explicitly state:
-     "Information not found in provided documentation."
-   - Never hallucinate.
-   - Never infer beyond what is supported by retrieved text.
+3. MANDATORY TRANSPARENT REASONING (Chain-of-Thought)
+You MUST start every response with a [THOUGHT PROCESS] block. This section is visible to the user and must detail:
+- Intent Categorization: Identify the query as Path A (Needle) or Path B (Bird's-Eye).
+- Tool Rationale: Explain why you chose the keyword-heavy or semantic-heavy tool based on the query terms.
+- Synthesis Strategy: Explain how you filtered the retrieved snippets (text or images) to arrive at the conclusion.
 
-2. MINIMIZE UNNECESSARY TOOL CALLS
-   - Before calling any tool, ask:
-       a) Is this information already available from previously retrieved context?
-       b) Can the question be answered from memory of prior retrieval in this session?
-   - If YES → Do NOT call a tool.
-   - If NO → Select the appropriate tool using the decision logic below.
-   - Never call both tools unless explicitly justified by the intent classification.
-   - Avoid iterative retrieval loops unless citation gaps are identified.
+4. AUDIT-READY TRACEABILITY & GROUNDING
+- Every single claim MUST be cited. Format: [Document Title, Section #, Page #].
+- Visual Evidence: If information is retrieved from a figure or table image, explicitly cite it as: [Document Title, Figure/Table #, Page #].
+- Context Constraints: You are restricted to the provided documents. If the answer is not in the retrieved context, state: "Information not found in the provided NICE TSDs." Do not use external training data or general knowledge.
 
----
+5. FEW-SHOT EXAMPLES (EXEMPLARS)
 
-### HYBRID INTENT RECOGNITION (MANDATORY DECISION TREE)
+EXAMPLE 1 (PATH A):
+User: "What is the recommended prior distribution for the between-study heterogeneity variance in TSD 2?"
+[THOUGHT PROCESS]
+- Intent: Path A (Needle-in-a-Haystack). The user is asking for a specific statistical parameter (prior distribution).
+- Tool Choice: 'precise_retrieval_tool' to target the keyword "prior distribution" and "heterogeneity variance."
+- Synthesis: I will look for the specific section in TSD 2 that defines the Bayesian implementation of NMA.
+[ANSWER]
+For the between-study heterogeneity variance, TSD 2 suggests using a non-informative prior such as a Uniform(0, 2) or a vague Gamma distribution, though it notes that the choice can significantly impact results in small networks.
+[SOURCES & EVIDENCE]
+- Claim: Guidance on Uniform/Gamma priors. Source: [TSD 2, Section 3.4.1, Page 15]
 
-Step 1: Classify the user’s request into one of the following:
+EXAMPLE 2 (PATH B):
+User: "Summarize the overarching challenges of cross-over trials in NICE appraisals according to the TSDs."
+[THOUGHT PROCESS]
+- Intent: Path B (Bird's-Eye-View). This requires synthesizing challenges across multiple sections.
+- Tool Choice: 'summarizer_retrieval_tool' to capture the semantic themes of "bias," "switching," and "limitations."
+- Synthesis: I will identify key themes like IPCW modeling and selection bias from the top 10 results.
+[ANSWER]
+The TSDs identify three main challenges: 1) Selection bias during treatment switching, 2) Loss of randomization benefits, and 3) The complexity of choosing appropriate adjustment models like Rpsftm.
+[SOURCES & EVIDENCE]
+- Claim: Selection bias and switching. Source: [TSD 16, Section 2.1, Page 5]
+- Claim: Modeling complexity. Source: [TSD 16, Section 4.2, Page 22]
 
-A) PRECISION REQUEST
-   Characteristics:
-   - Specific formula
-   - Specific equation
-   - Specific section number
-   - Named model (e.g., RPSFTM, MAIC)
-   - Exact assumptions of a single method
-   - Implementation details
-   - Code references
-   - Reporting checklists
-   - “What does TSD X say about Y?”
+### OUTPUT STRUCTURE
 
-   → Use: precise_retrieval_tool
-
-B) SYNTHESIS / CROSS-DOCUMENT REQUEST
-   Characteristics:
-   - Conceptual comparison
-   - “How should X be handled in NICE submissions?”
-   - “What are the methodological considerations…”
-   - “Across TSDs, what guidance exists on…”
-   - Questions that likely span survival + utilities + PSA
-   - Structural vs statistical trade-offs
-   - Extrapolation + expert elicitation
-   - Multiple interacting frameworks
-
-   → Use: summarizer_retrieval_tool
-
-C) MIXED REQUEST
-   - Starts broad but requires specific technical anchors
-   - Requires both thematic framing AND exact assumptions
-
-   → First use summarizer_retrieval_tool
-   → Only call precise_retrieval_tool if a missing technical detail is identified.
-
-Step 2: Confirm that your tool selection matches the classification.
-Step 3: Proceed with retrieval.
+[THOUGHT PROCESS]
+(Document your internal reasoning and tool selection logic here)
 
 ---
 
-### MULTI-AGENT ORCHESTRATION
-
-You operate in three internal stages:
-
-Step 1 – Retriever Agent
-   - Call the selected tool once.
-   - Retrieve only relevant sections.
-   - Do not over-query.
-
-Step 2 – Verifier Agent
-   - Check:
-       • Every claim has a citation.
-       • No unsupported extrapolation.
-       • Sections cited match the claim.
-   - If a citation gap exists:
-       → Re-run retrieval with refined keywords.
-   - Do NOT re-run retrieval if citations are already adequate.
-
-Step 3 – Final Auditor
-   - Ensure:
-       • Professional tone.
-       • Clear structure.
-       • No redundancy.
-       • No overstatement.
-       • No unnecessary citations.
+[ANSWER]
+(Provide a clear, technical, and objective response in professional prose)
 
 ---
 
-### RESPONSE FORMAT (MANDATORY)
-
-<thought_process>
-1. Intent Classification:
-2. Tool Selection Rationale:
-3. Retrieval Summary:
-4. Verification Steps:
-5. Justification for any additional tool calls (if applicable):
-</thought_process>
-
-### ANSWER
-[Grounded, structured, citation-backed response]
-
-### SOURCES
-1. [Document Name] – [Authors] – [Section]
-2. ...
+[SOURCES & EVIDENCE]
+- **Claim:** [Finding/Data Point] — *Source: [Doc Name, Section, Page]*
 """
 # default_system_prompt = """
 # ### ROLE
@@ -188,7 +139,7 @@ class RAG:
 
             self.source_path = pdf_docs_dir if pdf_docs_dir else None
             self.cwd = working_dir_path if working_dir_path else Path.cwd() / "rag_working_dir"
-            self.llm = ChatOpenAI(model=llm_model, temperature=0.0)
+            self.llm = image_agent(model=llm_model, temperature=0.0)
             self.images = {}
             self.mkd_docs = []
             self.img_docs = []
@@ -196,11 +147,21 @@ class RAG:
             self.splitter = splitter
             self.checkpointer = InMemorySaver()
             self.system_prompt = system_prompt
+            self.middleware = [
+                SummarizationMiddleware(
+                    model=image_agent(model = "gpt-4o-mini", temperature=0.0),
+                    trigger=("tokens", 40000),
+                    keep=("messages", 10),
+                    system_prompt="You are a helpful assistant that summarizes conversation history to save tokens while retaining important information. Summarize previous messages concisely, focusing on key points relevant to ongoing discussion about the NICE TSDs. Omit any redundant or less important details. In case of images, keep their caption or a simple relevant summary of it."
+                )
+            ]
 
             if not self.cwd.is_dir():
                 self.cwd.mkdir(parents=True)
                 vectorstore_path = self.cwd / "vectorstore"
                 vectorstore_path.mkdir(parents=False)
+            
+            else: self.setup_from_working_dir()
 
             self.vectorstore = Chroma(
                 collection_name="tsd_vector_store",
@@ -212,22 +173,23 @@ class RAG:
                 description= rt.precise_retrieval_desctiption,
                 documents = self.mkd_docs + self.img_docs,
                 images= self.images,
-                retriever = self.vectorstore.as_retriever(search_kwargs={"k": 5}),
+                vectorstore= self.vectorstore,
             )
             self.summarizer_retrieval_tool = rt.retrieval_tool(
                 name = "summarizer_retrieval_tool",
                 description= rt.summarizer_retrieval_description,
                 bm25_weight=0.3,
-                semantic_weight=0.7,
                 documents = self.mkd_docs + self.img_docs,
                 images= self.images,
-                retriever = self.vectorstore.as_retriever(search_kwargs={"k": 10}),
+                k=10,
+                vectorstore= self.vectorstore,
             )
             self.agent = create_agent(
                 model=self.llm,
                 tools = [self.precise_retrieval_tool, self.summarizer_retrieval_tool],
                 system_prompt=self.system_prompt,
                 checkpointer=self.checkpointer,
+                middleware=self.middleware
             )
 
         else:
@@ -240,26 +202,42 @@ class RAG:
             description= rt.precise_retrieval_desctiption,
             documents = self.mkd_docs + self.img_docs,
             images= self.images,
-            retriever = self.vectorstore.as_retriever(search_kwargs={"k": 5}),
+            vectorstore= self.vectorstore,
         )
         self.summarizer_retrieval_tool = rt.retrieval_tool(
             name = "summarizer_retrieval_tool",
             description= rt.summarizer_retrieval_description,
             bm25_weight=0.3,
-            semantic_weight=0.7,
             documents = self.mkd_docs + self.img_docs,
             images= self.images,
-            retriever = self.vectorstore.as_retriever(search_kwargs={"k": 10}),
+            k=10,
+            vectorstore= self.vectorstore,
         )
         self.agent = create_agent(
             model=self.llm,
             tools = [self.precise_retrieval_tool, self.summarizer_retrieval_tool],
             system_prompt=self.system_prompt,
             checkpointer=self.checkpointer,
+            middleware=self.middlewares
         )
 
         return True
 
+    def setup_from_working_dir(self):
+        mkd_path = self.cwd / "markdown_files"
+        img_path = self.cwd / "image_files"
+
+        if not mkd_path.is_dir() or not img_path.is_dir():
+            raise ValueError("Working directory must contain 'markdown_files' and 'image_files' subdirectories.")
+
+        mkd_docs, img_docs, imgs = di.load_data(mkd_path, img_path, self.splitter)
+        
+        self.images.update(imgs)
+        self.mkd_docs.extend(mkd_docs)
+        self.img_docs.extend(img_docs)
+
+        return True
+    
     def ingest_from_pdf(self, input_path: Path | list[Path] | None = None, ingest_from_main_source: bool = True, converter: DocumentConverter = di.default_converter):
         
         if input_path:
@@ -294,14 +272,16 @@ class RAG:
         
         return True
     
-    def ingest_from_mkd_imgs(self, mkd_dir: Path, imgs_dir: Path, splitter: TextSplitter = MarkdownHeaderTextSplitter(headers_to_split_on=[("#", "Header 1"), ("##", "Header 2"), ("###", "Header 3")])):
+    def ingest_from_mkd_imgs(self, mkd_dir: Path = None, imgs_dir: Path = None, splitter: TextSplitter | None = None):
         
+        if not splitter: splitter = self.splitter
+  
         mkd_docs, img_docs, imgs = di.load_data(mkd_dir, imgs_dir, splitter)
-        
+            
         self.images.update(imgs)
         self.mkd_docs.extend(mkd_docs)
         self.img_docs.extend(img_docs)
-
+        
         all_docs = mkd_docs + img_docs
         self.vectorstore.add_documents(all_docs)
         
@@ -361,3 +341,18 @@ class RAG:
             {"configurable": {"thread_id": thread_id}}
         )
         return response
+    
+    def analyze_stream(self, user_message, thread_id='default_thread'):
+        """
+        Analyzes the user's message using the agent in a streaming manner.
+        Args:
+            user_message: The message from the user to be analyzed.
+            thread_id: The thread ID for maintaining conversation context.
+        """
+        for token, metadata in self.agent.stream(
+            {"messages": [HumanMessage(content=user_message)]},
+            {"configurable": {"thread_id": thread_id}},
+            stream_mode="messages"
+        ):
+            if token.content:
+                yield token.content

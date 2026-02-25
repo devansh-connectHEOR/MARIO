@@ -19,3 +19,7 @@ nltk
 unstructured
 rank_bm25
 chromadb
+shiny
+streamlit
+neo4j
+neo4j-graphrag

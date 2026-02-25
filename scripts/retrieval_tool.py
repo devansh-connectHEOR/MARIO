@@ -2,11 +2,14 @@ from langchain_core.tools import BaseTool, ToolException
 from langchain_core.retrievers import BaseRetriever
 from pydantic import BaseModel, Field
 from langchain_core.documents import Document
+from langchain_chroma import Chroma
+from typing import Type, Any
 
 from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+import asyncio
 
 precise_retrieval_desctiption = """
 A high-precision technical retrieval tool optimized for HEOR and NICE Technical Support Documents (TSD). 
@@ -37,24 +40,48 @@ It is engineered to prioritize 'theme-matching' over 'exact-word-matching.'
 """
 
 class retrieval_tool(BaseTool):
+
     name: str 
     description: str 
     bm25_weight: float = Field(default=0.7, description="Weight for BM25 retriever in the ensemble.")
-    semantic_weight: float = Field(default=0.3, description="Weight for semantic retriever in the ensemble.")
+    k: int = Field(default=5, description="Number of top documents to retrieve.")
     documents: list[Document]
     images: dict[str, str]
-    retriever: BaseRetriever
+    vectorstore: Any
 
-    def create_context(self, docs: list[Document]) -> str:
-        content = ["Context:\n"]
-        text_docs = [d for d in docs if d.metadata.get("type") == "text"]
-        img_docs = [d for d in docs if d.metadata.get("type") == "image"]
-        for doc in text_docs:
-            content.append(f"type: text\nDocument Title: {doc.metadata.get('title')}\nAuthors: {doc.metadata.get('authors')}\nDocument Type: {doc.metadata.get('doc_type')}\nContent: {doc.page_content}\n")
 
-        for doc in img_docs:
-            content.append(f"type: image\nDocument Title: {doc.metadata.get('document')}\nDocument Type: {doc.metadata.get('doc_type')}\nImage Description: {doc.metadata.get('caption')}\nPage no: {doc.metadata.get('page_no')}\nImage: {self.images.get(doc.metadata.get('image'))}")
-        return "\n\n".join(content)
+    def create_context(self, docs: list[Document]) -> list[dict]:
+        content = []
+        for doc in docs:
+            if doc.metadata.get("type") == "image":
+                im_dict = [
+                    {"type": "text",
+                     "text": f"The following image is from document {doc.metadata.get('document')}, page {doc.metadata.get('page_no')}, titled '{doc.metadata.get('caption')}'."
+                     },
+                    {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{self.images.get(doc.metadata.get('image'))}",
+                        "detail": "low"  # Best practice for cost/constraint management
+                    }
+                }]
+                content.extend(im_dict)
+            else:
+                text_content = (
+                    f"Document Title: {doc.metadata.get('title')}\n"
+                    f"Authors: {doc.metadata.get('authors')}\n"
+                    f"Document Type: {doc.metadata.get('doc_type')}\n"
+                    f"Header 1: {doc.metadata.get('Header 1')}\n"
+                    f"Header 2: {doc.metadata.get('Header 2')}\n"
+                    f"Header 3: {doc.metadata.get('Header 3')}\n"
+                    f"Content: {doc.page_content}"
+                )
+                tex_dict = {
+                    "type": "text",
+                    "text": text_content
+                }
+                content.append(tex_dict)
+        return content
 
 
     class doc_type(BaseModel):
@@ -62,21 +89,37 @@ class retrieval_tool(BaseTool):
 
 
     def _run(self, query: str) -> str:
-        if not self.retriever:
-            raise ToolException("Retriever not set for RetrievalTool.")
+
+        if not self.vectorstore:
+            raise ToolException("Vectorestore not set for RetrievalTool.")
+        
+        retriever = self.vectorstore.as_retriever(search_kwargs={"k": self.k})
 
         doc_type_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3).with_structured_output(self.doc_type)
         doc_type = doc_type_llm.invoke(query)
-        doc_type = doc_type.doc_type if doc_type != "Both" else None
+        doc_type = doc_type.doc_type if doc_type.doc_type != "Both" else None
+        documents = self.documents
+        #print(f"Determined doc_type for retrieval: {doc_type}")
         if doc_type:
-            self.retriever.search_kwargs["filter"] = {"doc_type": doc_type}
-            documents = [d for d in self.documents if d.metadata.get("doc_type") == doc_type]
-        bm25 = BM25Retriever.from_documents(self.documents, search_kwargs={"k": 5})
+            retriever.search_kwargs["filter"] = {"doc_type": doc_type}
+            documents = [d for d in documents if d.metadata.get("doc_type") == doc_type]
+            #print(len(documents))
+        bm25 = BM25Retriever.from_documents(documents, k = self.k)
+        
+        #print(len(bm25.invoke(query)), len(retriever.invoke(query)))
+        
         ensemble_retriever = EnsembleRetriever(
-            retrievers=[self.retriever, bm25],
-            weights=[0.3, 0.7]
+            retrievers=[retriever, bm25],
+            weights=[1.0 - self.bm25_weight, self.bm25_weight],
+
         )
-        retrieved_docs = ensemble_retriever.invoke(query)
+        rrf_docs = ensemble_retriever.invoke(query)
+        
+        text_indices = [idx for idx, d in enumerate(rrf_docs) if d.metadata.get('type') == 'text']
+        stop_idx = text_indices[self.k] if len(text_indices) > self.k else len(rrf_docs)
+        retrieved_docs = rrf_docs[:stop_idx]
+        
+        #print(len(retrieved_docs))
         context = self.create_context(retrieved_docs)
         return context
         
