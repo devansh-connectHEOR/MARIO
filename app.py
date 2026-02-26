@@ -21,7 +21,7 @@ if 'messages' not in st.session_state:
 
 # --- Agent Setup ---
 if "app" not in st.session_state:
-    cwd = Path(r"C:\Users\Public\Documents\MARIO\rag_working_dir")
+    cwd = Path.cwd() / "rag_working_dir"
     rag = RAG(None, cwd)
 
     st.session_state.app = rag

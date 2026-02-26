@@ -1,20 +1,19 @@
 import scripts.data_ingestion as di
-import scripts.utilities as ut
 import scripts.retrieval_tool as rt
-from scripts.agent import image_agent
+from scripts.image_llm import image_llm
 
-from pathlib import Path
 from langchain_core.documents import Document
 from langchain_text_splitters.base import TextSplitter
 from docling.document_converter import DocumentConverter
+import pydantic
+from pathlib import Path
 
 from langchain_text_splitters import MarkdownHeaderTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_chroma import Chroma
-from pydantic import BaseModel, Field
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
-from langchain.agents import create_agent
+import langchain.agents
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain.messages import HumanMessage
 from langchain.agents.middleware import SummarizationMiddleware
@@ -129,7 +128,7 @@ class RAG:
             self, 
             pdf_docs_dir: Path | None, 
             working_dir_path: Path | None = None, 
-            llm_model: str = "gpt-4o-mini", 
+            llm_model: str = "gpt-4o", 
             embeddings_model: str = "text-embedding-3-small", 
             splitter: TextSplitter = MarkdownHeaderTextSplitter(headers_to_split_on=[("#", "Header 1"), ("##", "Header 2"), ("###", "Header 3")]), 
             system_prompt: str = default_system_prompt
@@ -139,7 +138,7 @@ class RAG:
 
             self.source_path = pdf_docs_dir if pdf_docs_dir else None
             self.cwd = working_dir_path if working_dir_path else Path.cwd() / "rag_working_dir"
-            self.llm = image_agent(model=llm_model, temperature=0.0)
+            self.llm = image_llm(model=llm_model, temperature=0.0)
             self.images = {}
             self.mkd_docs = []
             self.img_docs = []
@@ -149,9 +148,9 @@ class RAG:
             self.system_prompt = system_prompt
             self.middleware = [
                 SummarizationMiddleware(
-                    model=image_agent(model = "gpt-4o-mini", temperature=0.0),
+                    model=image_llm(model = "gpt-4o-mini", temperature=0.0),
                     trigger=("tokens", 40000),
-                    keep=("messages", 10),
+                    keep=("messages", 3),
                     system_prompt="You are a helpful assistant that summarizes conversation history to save tokens while retaining important information. Summarize previous messages concisely, focusing on key points relevant to ongoing discussion about the NICE TSDs. Omit any redundant or less important details. In case of images, keep their caption or a simple relevant summary of it."
                 )
             ]
@@ -184,7 +183,7 @@ class RAG:
                 k=10,
                 vectorstore= self.vectorstore,
             )
-            self.agent = create_agent(
+            self.agent = langchain.agents.create_agent(
                 model=self.llm,
                 tools = [self.precise_retrieval_tool, self.summarizer_retrieval_tool],
                 system_prompt=self.system_prompt,
@@ -213,7 +212,7 @@ class RAG:
             k=10,
             vectorstore= self.vectorstore,
         )
-        self.agent = create_agent(
+        self.agent = langchain.agents.create_agent(
             model=self.llm,
             tools = [self.precise_retrieval_tool, self.summarizer_retrieval_tool],
             system_prompt=self.system_prompt,
@@ -287,55 +286,7 @@ class RAG:
         
         return True
         
-
-    class doc_type(BaseModel):
-        doc_type: str = Field(description="Whether the document is a TSD (Technical Support Document) or a TA (Technical Assessment).")
-    
-    def create_context(self, docs: list[Document]) -> str:
-        content = ["Context:\n"]
-        text_docs = [d for d in docs if d.metadata.get("type") == "text"]
-        img_docs = [d for d in docs if d.metadata.get("type") == "image"]
-        for doc in text_docs:
-            content.append(f"type: text\nDocument Title: {doc.metadata.get('title')}\nAuthors: {doc.metadata.get('authors')}\nDocument Type: {doc.metadata.get('doc_type')}\nContent: {doc.page_content}\n")
-
-        for doc in img_docs:
-            content.append(f"type: image\nDocument Title: {doc.metadata.get('document')}\nDocument Type: {doc.metadata.get('doc_type')}\nImage Description: {doc.metadata.get('caption')}\nPage no: {doc.metadata.get('page_no')}\nImage: {self.images.get(doc.metadata.get('image'))}")
-        return "\n\n".join(content)
-    
-    def query_with_context(self, query: str, k: int = 5) -> str:
-        retriever = self.vectorstore.as_retriever(search_kwargs={"k": k})
-        
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-        doc_type_llm = llm.with_structured_output(self.doc_type)
-        doc_type = doc_type_llm.invoke(query)
-        doc_type = doc_type.doc_type if doc_type else None
-
-        mkd_docs = self.mkd_docs    #For keyword search using BM25
-
-        if doc_type:
-            retriever.search_kwargs["filter"] = {"doc_type": doc_type}
-            mkd_docs = [d for d in mkd_docs if d.metadata.get("doc_type") == doc_type]
-        
-        ensemble_retriever = EnsembleRetriever(
-            retrievers=[retriever, BM25Retriever.from_documents(mkd_docs, search_kwargs={"k": k})] if mkd_docs else [retriever],
-            weights=[0.5, 0.5] if mkd_docs else [1.0]
-        )
-
-        retrieved_docs = ensemble_retriever.invoke(query)
-        context = self.create_context(retrieved_docs)
-        augmented_query = f"{context}\n\nQuestion: {query}"
-
-        return augmented_query
-    
-    def answer_with_context(self, query: str, k: int = 5, thread_id='default_thread'):
-        augmented_query = self.query_with_context(query, k)
-        response = self.agent.invoke(
-            {"messages": [HumanMessage(content=augmented_query)]},
-            {"configurable": {"thread_id": thread_id}}
-        )
-        return response
-
-    def answer(self, query:str, thread_id='default_thread'):
+    def analyze(self, query:str, thread_id='default_thread'):
         response = self.agent.invoke(
             {"messages": [HumanMessage(content=query)]},
             {"configurable": {"thread_id": thread_id}}

@@ -2,7 +2,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import ToolMessage, HumanMessage, BaseMessage
 from typing import Any, List, Optional
 
-class image_agent(ChatOpenAI):
+class image_llm(ChatOpenAI):
     """
     A wrapper that intercepts messages and moves images from 
     'tool' messages to 'user' messages for OpenAI compatibility.
