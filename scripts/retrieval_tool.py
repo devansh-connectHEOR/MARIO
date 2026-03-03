@@ -61,8 +61,8 @@ class retrieval_tool(BaseTool):
                     {
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/jpeg;base64,{self.images.get(doc.metadata.get('image'))}",
-                        "detail": "low"  # Best practice for cost/constraint management
+                        "url": f"data:image/png;base64,{self.images.get(doc.metadata.get('image'))}",
+                        "detail": "low"
                     }
                 }]
                 content.extend(im_dict)

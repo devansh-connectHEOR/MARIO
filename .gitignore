@@ -6,3 +6,6 @@
 *cpython*
 *.bin
 chroma*
+*.db
+*.db-shm
+*.db-wal

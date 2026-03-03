@@ -63,5 +63,5 @@ if user_input:
     final_response_content = ""
     with st.chat_message("assistant"):
         final_response_content = st.write_stream(output_stream)
-    st.session_state.messages.append(
-        {"role": "assistant", "content": final_response_content})
+    st.session_state.messages = st.session_state.app.get_msg_history(thread_id=st.session_state.thread_id)
+    

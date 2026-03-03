@@ -15,12 +15,13 @@ from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 import langchain.agents
 from langgraph.checkpoint.memory import InMemorySaver
-from langchain.messages import HumanMessage
+from langchain.messages import HumanMessage, ToolMessage
 from langchain.agents.middleware import SummarizationMiddleware
+
 
 default_system_prompt = """
 ### ROLE
-You are the NICE TSD Expert Research Agent, a specialized clinical librarian assistant. Your purpose is to provide professionals with precise, audit-ready, evidence-based answers derived strictly from NICE Technical Support Documents (TSDs). 
+You are the NICE TSD Expert Teacher Agent, a specialized clinical librarian assistant adn explainer. Your purpose is to provide new professionals with precise, audit-ready, evidence-based answers derived strictly from NICE Technical Support Documents (TSDs). 
 
 ### OPERATIONAL FRAMEWORK
 
@@ -32,6 +33,8 @@ Before selecting a tool, categorize the user query into one of two paths:
 2. REFINED TOOL SELECTION LOGIC
 - USE 'precise_retrieval_tool' for PATH A: This tool gives more weight to keyword search. Use it when the query contains specific jargon, acronyms, or specific section numbers. It is best for high-fidelity extraction of the top 5 documents.
 - USE 'summarizer_retrieval_tool' for PATH B: This tool gives more weight to semantic search. Use it when the query is conceptual or broad. It is best for capturing the intent of guidance across the top 10 documents.
+- Do not call the tools unnecessarily! Call only if the information already available in the conversation/tool messages is not sufficient to answer the question.
+- Refrain from calling the tools multiple times unless necessary.
 
 3. MANDATORY TRANSPARENT REASONING (Chain-of-Thought)
 You MUST start every response with a [THOUGHT PROCESS] block. This section is visible to the user and must detail:
@@ -43,6 +46,7 @@ You MUST start every response with a [THOUGHT PROCESS] block. This section is vi
 - Every single claim MUST be cited. Format: [Document Title, Section #, Page #].
 - Visual Evidence: If information is retrieved from a figure or table image, explicitly cite it as: [Document Title, Figure/Table #, Page #].
 - Context Constraints: You are restricted to the provided documents. If the answer is not in the retrieved context, state: "Information not found in the provided NICE TSDs." Do not use external training data or general knowledge.
+- Do not hallucinate information/data/facts or any point.
 
 5. FEW-SHOT EXAMPLES (EXEMPLARS)
 
@@ -128,10 +132,11 @@ class RAG:
             self, 
             pdf_docs_dir: Path | None, 
             working_dir_path: Path | None = None, 
-            llm_model: str = "gpt-4o", 
+            llm_model: str = "gpt-4.1", 
             embeddings_model: str = "text-embedding-3-small", 
             splitter: TextSplitter = MarkdownHeaderTextSplitter(headers_to_split_on=[("#", "Header 1"), ("##", "Header 2"), ("###", "Header 3")]), 
-            system_prompt: str = default_system_prompt
+            system_prompt: str = default_system_prompt,
+            checkpointer = InMemorySaver()
     ):
 
         if pdf_docs_dir or working_dir_path:
@@ -144,7 +149,7 @@ class RAG:
             self.img_docs = []
             self.embeddings = OpenAIEmbeddings(model=embeddings_model)
             self.splitter = splitter
-            self.checkpointer = InMemorySaver()
+            self.checkpointer = checkpointer
             self.system_prompt = system_prompt
             self.middleware = [
                 SummarizationMiddleware(
@@ -286,6 +291,17 @@ class RAG:
         
         return True
         
+    def get_msg_history(self, thread_id='default_thread'):
+        try:
+            msgs = self.agent.get_state(config = {"configurable": {"thread_id":thread_id}}).values['messages']
+            msgs = [i for i in msgs if not isinstance(i, ToolMessage)]
+            msgs = [
+            {"role":"user" if isinstance(i, HumanMessage) else "assistant", "content": i.content} for i in msgs
+            ]
+        except KeyError:
+            msgs = []
+        return msgs
+
     def analyze(self, query:str, thread_id='default_thread'):
         response = self.agent.invoke(
             {"messages": [HumanMessage(content=query)]},
