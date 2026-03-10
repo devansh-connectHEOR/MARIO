@@ -101,7 +101,7 @@ def add_session(sqldb, id, title = "Untitled"):
     try:
         cursor.execute(query, (id, title))
         sqldb.commit()
-        return "Success: Session added."
+        return f"Success: Session {title} added."
     
     except sqlite3.IntegrityError:
         # This triggers if 'id' is a Primary Key and already exists

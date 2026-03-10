@@ -1,6 +1,6 @@
 from langchain_core.tools import BaseTool, ToolException
 from langchain_core.retrievers import BaseRetriever
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
 from typing import Type, Any
@@ -8,8 +8,12 @@ from typing import Type, Any
 from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_openai import ChatOpenAI
+from langchain_openai import OpenAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 import asyncio
+
+from langchain_community.vectorstores import Neo4jVector
+
 
 precise_retrieval_desctiption = """
 A high-precision technical retrieval tool optimized for HEOR and NICE Technical Support Documents (TSD). 
@@ -39,7 +43,24 @@ rather than specific (e.g., 'What is the formula in TSD 14?').
 It is engineered to prioritize 'theme-matching' over 'exact-word-matching.'
 """
 
-class retrieval_tool(BaseTool):
+graph_retrieval_query = """
+// 1. Find the original Document chunk that mentions our matched node
+MATCH (node)<-[:MENTIONS]-(doc:Document)
+
+// 2. Optionally, grab the graph relationships connected to our node (excluding the MENTIONS link)
+OPTIONAL MATCH (node)-[rel]-(neighbor)
+WHERE type(rel) <> 'MENTIONS'
+
+// 3. Bundle the relationships together
+WITH doc, node, score, collect(node.id + ' ' + type(rel) + ' ' + neighbor.id) AS relationships
+
+// 4. Return the rich chunk text AND the structural relationships back to the LLM!
+RETURN "Original Source Text:\n" + doc.text + "\n\nExtracted Relationships:\n" + reduce(s="", r in relationships | s + r + '\n') AS text, 
+       score, 
+       {} AS metadata
+"""
+
+class vector_retrieval_tool(BaseTool):
 
     name: str 
     description: str 
@@ -122,4 +143,23 @@ class retrieval_tool(BaseTool):
         #print(len(retrieved_docs))
         context = self.create_context(retrieved_docs)
         return context
-        
+
+class graph_retrieval_tool(BaseTool):
+
+    name: str = "graph_retrieval_tool"
+    description: str = "A tool to retrieve context information and cross document relationships"
+    _embeddings:Any = PrivateAttr()
+
+    _graph_retriever:Any = PrivateAttr()
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        self._graph_retriever = Neo4jVector.from_existing_index(
+            embedding=self._embeddings,
+            index_name="vector", 
+            retrieval_query=graph_retrieval_query
+        ).as_retriever(search_kwargs={"k": 5})
+    
+    def _run(self, query: str) -> str:
+        return self._graph_retriever.invoke(query)
