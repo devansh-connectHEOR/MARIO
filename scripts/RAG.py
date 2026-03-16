@@ -1,4 +1,4 @@
-import scripts.data_ingestion as di
+import scripts.utilities.data_ingestion as di
 import scripts.retrieval_tool as rt
 from scripts.image_llm import image_llm
 
@@ -15,6 +15,7 @@ from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 import langchain.agents
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langchain.messages import HumanMessage, ToolMessage
 from langchain.agents.middleware import SummarizationMiddleware
 
@@ -155,44 +156,7 @@ The relationship between uncertainty and cost-effectiveness is bridged by the re
 - **Entity/Claim:** [Finding/Data Point] — *Source: [Doc Name, Section, Page]*
 - **Relationship (if applicable):** [How Entity A connects to Entity B] — *Source: [Doc Name, Page # or Link Type]*
 """
-# default_system_prompt = """
-# ### ROLE
-# You are the Lead Orchestrator for a high-stakes HEOR (Health Economics and Outcomes Research) Research Agent. Your primary mission is to provide technically precise, audit-ready answers from a massive corpus of NICE Technical Support Documents (TSDs) and Systematic Literature Reviews (SLRs).
 
-# ### OPERATIONAL GUIDELINES
-# 1. AUDIT-READY TRACEABILITY
-#    - Every factual claim MUST be followed by a citation in the format: [Source Document Name, Authors, Section X.Y].
-#    - If information is missing from the source, explicitly state: "Information not found in provided documentation." Never hallucinate.
-
-# 2. HYBRID INTENT RECOGNITION (Tool Selection Logic)
-#    - Evaluate the user's intent BEFORE searching.
-#    - For specific codes, formulas, or "Needle-in-a-Haystack" facts: Use the 'precise_retrieval_tool' tool.
-#    - For thematic summaries, trends, or "Bird's-Eye-View" overviews: Use the 'summarizer_retrieval_tool' tool.
-
-# 3. TRANSPARENT REASONING (Chain-of-Thought)
-#    - You must begin every response with a <thought_process> block.
-#    - In this block, outline:
-#      a) Intent Classification (Precision vs. Synthesis).
-#      b) Tool Selection Rationale.
-#      c) Step-by-step logic for synthesizing the retrieved data.
-#      d) Fact-checking steps taken.
-
-# 4. MULTI-AGENT ORCHESTRATION & SELF-CORRECTION
-#    - Step 1 (Retriever Agent): Fetch data using the chosen hybrid tool.
-#    - Step 2 (Verifier Agent): Cross-reference the retrieved text against your draft. If a citation is missing or a claim is unsupported, loop back and re-run retrieval with a different keyword strategy.
-#    - Step 3 (Final Auditor): Ensure the tone is professional, the data is accurate, and the formatting is clean.
-
-# ### RESPONSE FORMAT
-# <thought_process>
-# [Your internal logic goes here...]
-# </thought_process>
-
-# ### ANSWER
-# [Your grounded response with citations...]
-
-# ### SOURCES
-# 1. [Document Name] - [Authors] - [Section]
-# """
 
 class RAG:
     def __init__(
@@ -256,9 +220,12 @@ class RAG:
                 vectorstore= self.vectorstore,
             )
             self.graph_retrieval_tool = rt.graph_retrieval_tool()
+
+            self.tools = [self.precise_retrieval_tool, self.summarizer_retrieval_tool]
+
             self.agent = langchain.agents.create_agent(
                 model=self.llm,
-                tools = [self.precise_retrieval_tool, self.summarizer_retrieval_tool],
+                tools = self.tools,
                 system_prompt=self.system_prompt,
                 checkpointer=self.checkpointer,
                 middleware=self.middleware
@@ -267,58 +234,51 @@ class RAG:
         else:
             raise ValueError("At least one of pdf_docs_path or working_dir_path must be provided.") 
     
-    def update_tools_agents(self):
-
-        self.precise_retrieval_tool = rt.vector_retrieval_tool(
-            name = "precise_retrieval_tool",
-            description= rt.precise_retrieval_desctiption,
-            documents = self.mkd_docs + self.img_docs,
-            images= self.images,
-            vectorstore= self.vectorstore,
-        )
-        self.summarizer_retrieval_tool = rt.vector_retrieval_tool(
-            name = "summarizer_retrieval_tool",
-            description= rt.summarizer_retrieval_description,
-            bm25_weight=0.3,
-            documents = self.mkd_docs + self.img_docs,
-            images= self.images,
-            k=10,
-            vectorstore= self.vectorstore,
-        )
+    def update_agent(self, model:str = "gpt-4.1", system_prompt:str = default_system_prompt) -> str:
+        """
+        For changing the underlying openai model and/or the system prompt
+        args:
+            model
+        """
+        self.llm = image_llm(model=model, temperature=0.0)
+        self.system_prompt = system_prompt
+        
         self.agent = langchain.agents.create_agent(
             model=self.llm,
-            tools = [self.precise_retrieval_tool, self.summarizer_retrieval_tool],
+            tools = self.tools,
             system_prompt=self.system_prompt,
             checkpointer=self.checkpointer,
             middleware=self.middleware
         )
 
-        return True
+        return "Agent updated!"
 
     def switch_RAG(self, system_prompt = default_system_prompt):
         self.system_prompt = system_prompt
+        self.tools = [self.precise_retrieval_tool, self.summarizer_retrieval_tool]
         self.agent = langchain.agents.create_agent(
             model=self.llm,
-            tools = [self.precise_retrieval_tool, self.summarizer_retrieval_tool],
+            tools = self.tools,
             system_prompt=self.system_prompt,
             checkpointer=self.checkpointer,
             middleware=self.middleware
         )
 
         return "RAG setup complete"
-    
+        
     def switch_GRAG(self, system_prompt = grag_system_prompt):
-        self.system_prompt = grag_system_prompt
+        self.system_prompt = system_prompt
+        self.tools = [self.graph_retrieval_tool]
         self.agent = langchain.agents.create_agent(
             model=self.llm,
-            tools = [self.graph_retrieval_tool],
+            tools = self.tools,
             system_prompt=self.system_prompt,
             checkpointer=self.checkpointer,
             middleware=self.middleware
         )
 
-        return "GRAG setup complete"       
-
+        return "GRAG setup complete"    
+   
     def setup_from_working_dir(self):
         mkd_path = self.cwd / "markdown_files"
         img_path = self.cwd / "image_files"
@@ -332,56 +292,7 @@ class RAG:
         self.mkd_docs.extend(mkd_docs)
         self.img_docs.extend(img_docs)
 
-        return True
-    
-    def ingest_from_pdf(self, input_path: Path | list[Path] | None = None, ingest_from_main_source: bool = True, converter: DocumentConverter = di.default_converter):
-        
-        if input_path:
-            if input_path.is_file():
-                raise ValueError("Input path must be a directory or a list of file paths.")
-        
-        documents = []
-        if ingest_from_main_source and self.source_path:
-            documents.extend(di.read_documents(self.source_path, converter))
-        
-        if input_path:
-            documents.extend(di.read_documents(input_path, converter))
-        
-        mkd_path = self.cwd / "markdown_files"
-        img_path = self.cwd / "image_files"
-
-        if not mkd_path.is_dir():
-            mkd_path.mkdir()
-        if not img_path.is_dir():
-            img_path.mkdir()
-
-        di.extract_markdown_images(documents, mkd_path, img_path)
-
-        mkd_docs, img_docs, imgs = di.load_data(mkd_path, img_path, self.splitter)
-        
-        self.images.update(imgs)
-        self.mkd_docs.extend(mkd_docs)
-        self.img_docs.extend(img_docs)
-
-        all_docs = mkd_docs + img_docs
-        self.vectorstore.add_documents(all_docs)
-        
-        return True
-    
-    def ingest_from_mkd_imgs(self, mkd_dir: Path = None, imgs_dir: Path = None, splitter: TextSplitter | None = None):
-        
-        if not splitter: splitter = self.splitter
-  
-        mkd_docs, img_docs, imgs = di.load_data(mkd_dir, imgs_dir, splitter)
-            
-        self.images.update(imgs)
-        self.mkd_docs.extend(mkd_docs)
-        self.img_docs.extend(img_docs)
-        
-        all_docs = mkd_docs + img_docs
-        self.vectorstore.add_documents(all_docs)
-        
-        return True
+        return "Documents and images loaded"
         
     def get_msg_history(self, thread_id='default_thread'):
         try:
@@ -401,6 +312,13 @@ class RAG:
         )
         return response
     
+    async def a_analyze(self, query: str, thread_id='default_thread'):
+        response = await self.agent.ainvoke(
+            {"messages": [HumanMessage(content=query)]},
+            {"configurable": {"thread_id": thread_id}}
+        )
+        return response
+    
     def analyze_stream(self, user_message, thread_id='default_thread'):
         """
         Analyzes the user's message using the agent in a streaming manner.
@@ -409,6 +327,18 @@ class RAG:
             thread_id: The thread ID for maintaining conversation context.
         """
         for token, metadata in self.agent.stream(
+            {"messages": [HumanMessage(content=user_message)]},
+            {"configurable": {"thread_id": thread_id}},
+            stream_mode="messages"
+        ):
+            if token.content:
+                yield token.content
+
+    async def a_analyze_stream(self, user_message, thread_id='default_thread'):
+        """
+        Analyzes the user's message using the agent in an asynchronous streaming manner.
+        """
+        async for token, metadata in self.agent.astream(
             {"messages": [HumanMessage(content=user_message)]},
             {"configurable": {"thread_id": thread_id}},
             stream_mode="messages"

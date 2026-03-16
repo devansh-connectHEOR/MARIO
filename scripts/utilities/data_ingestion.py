@@ -8,7 +8,7 @@ os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"     # Need to be disabled because of
 
 from docling.datamodel.base_models import InputFormat
 from docling.document_converter import DocumentConverter
-from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.datamodel.pipeline_options import PdfPipelineOptions, OcrAutoOptions
 from docling.document_converter import PdfFormatOption
 from docling.document_converter import ConversionResult
 import fitz
@@ -22,8 +22,11 @@ from langchain_text_splitters.base import TextSplitter
 
 pipeline_options = PdfPipelineOptions()
 
+pipeline_options.do_ocr = True
+pipeline_options.ocr_options = OcrAutoOptions()
+
 pipeline_options.do_formula_enrichment = True
-pipeline_options.generate_page_images = True
+pipeline_options.generate_page_images = False
 
 default_converter = DocumentConverter(
     format_options={
@@ -158,3 +161,52 @@ def load_data(markdown_path: Path = None, images_path: Path = None, splitter: Te
     
     return mkd_docs, img_docs, imgs
 
+
+    def ingest_from_pdf(self, input_path: Path | list[Path] | None = None, ingest_from_main_source: bool = True, converter: DocumentConverter = di.default_converter):
+        
+        if input_path:
+            if input_path.is_file():
+                raise ValueError("Input path must be a directory or a list of file paths.")
+        
+        documents = []
+        if ingest_from_main_source and self.source_path:
+            documents.extend(di.read_documents(self.source_path, converter))
+        
+        if input_path:
+            documents.extend(di.read_documents(input_path, converter))
+        
+        mkd_path = self.cwd / "markdown_files"
+        img_path = self.cwd / "image_files"
+
+        if not mkd_path.is_dir():
+            mkd_path.mkdir()
+        if not img_path.is_dir():
+            img_path.mkdir()
+
+        di.extract_markdown_images(documents, mkd_path, img_path)
+
+        mkd_docs, img_docs, imgs = di.load_data(mkd_path, img_path, self.splitter)
+        
+        self.images.update(imgs)
+        self.mkd_docs.extend(mkd_docs)
+        self.img_docs.extend(img_docs)
+
+        all_docs = mkd_docs + img_docs
+        self.vectorstore.add_documents(all_docs)
+        
+        return True
+    
+    def ingest_from_mkd_imgs(self, mkd_dir: Path = None, imgs_dir: Path = None, splitter: TextSplitter | None = None):
+        
+        if not splitter: splitter = self.splitter
+  
+        mkd_docs, img_docs, imgs = di.load_data(mkd_dir, imgs_dir, splitter)
+            
+        self.images.update(imgs)
+        self.mkd_docs.extend(mkd_docs)
+        self.img_docs.extend(img_docs)
+        
+        all_docs = mkd_docs + img_docs
+        self.vectorstore.add_documents(all_docs)
+        
+        return True

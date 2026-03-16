@@ -1,5 +1,5 @@
 from scripts.RAG import RAG
-from scripts.utilities import create_sqldb, list_sessions, add_session, rename_session, delete_sessions
+from scripts.utilities.db_utils import create_sqldb, list_sessions, add_session, rename_session, delete_sessions
 from pathlib import Path
 from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite import SqliteSaver

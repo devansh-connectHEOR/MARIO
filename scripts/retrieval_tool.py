@@ -77,9 +77,12 @@ class vector_retrieval_tool(BaseTool):
         super().__init__(**kwargs)
         self._bm25_cache[None] = BM25Retriever.from_documents(self.documents, k=self.k)
         # Pre-build for each doc_type
-        doc_types = ['TSD', 'TA']
+        doc_types = ['TSD', "TA"] # TAs not yet added
         for dt in doc_types:
             filtered = [d for d in self.documents if d.metadata.get("doc_type") == dt]
+            if not filtered:
+                print(f"Warning: No documents found for doc_type='{dt}', skipping BM25 index.")
+                continue
             self._bm25_cache[dt] = BM25Retriever.from_documents(filtered, k=self.k)
         self._doc_type_llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0.3).with_structured_output(self.doc_type)
 
