@@ -1,5 +1,5 @@
-import scripts.data_ingestion as di
-import scripts.utilities as ut
+import scripts.utilities.data_ingestion as di
+import scripts.utilities.metadata_utils as ut
 
 from pathlib import Path
 from langchain_core.documents import Document

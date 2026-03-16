@@ -28,8 +28,35 @@ class image_llm(ChatOpenAI):
                 fixed_messages.append(msg)
         return fixed_messages
 
-    def invoke(self, input: Any, config: Optional[Any] = None, **kwargs: Any):
-        # Fix messages before calling the real OpenAI invoke
-        if isinstance(input, list):
-            input = self._convert_messages(input)
-        return super().invoke(input, config, **kwargs)
+    # def invoke(self, input: Any, config: Optional[Any] = None, **kwargs: Any):
+    #     # Fix messages before calling the real OpenAI invoke
+    #     if isinstance(input, list):
+    #         input = self._convert_messages(input)
+    #     return super().invoke(input, config, **kwargs)
+
+    # async def ainvoke(self, input: Any, config: Optional[Any] = None, **kwargs: Any):
+    #     # Asynchronous version of invoke.
+    #     if isinstance(input, list):
+    #         input = self._convert_messages(input)
+    #     return await super().ainvoke(input, config, **kwargs)
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        messages = self._convert_messages(messages)
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        messages = self._convert_messages(messages)
+        return await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
+    
+    # def stream(self, input: Any, config: Optional[Any] = None, **kwargs: Any):
+    #     # Standard streaming support.
+    #     if isinstance(input, list):
+    #         input = self._convert_messages(input)
+    #     return super().stream(input, config, **kwargs)
+
+    # async def astream(self, input: Any, config: Optional[Any] = None, **kwargs: Any):
+    #     # Asynchronous streaming support.
+    #     if isinstance(input, list):
+    #         input = self._convert_messages(input)
+    #     async for chunk in super().astream(input, config, **kwargs):
+    #         yield chunk

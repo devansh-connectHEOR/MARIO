@@ -1,5 +1,5 @@
 from scripts.RAG import RAG
-from scripts.utilities import create_sqldb, list_sessions, add_session, rename_session
+from scripts.utilities.db_utils import create_sqldb, list_sessions, add_session, rename_session, delete_sessions
 from pathlib import Path
 from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -31,6 +31,20 @@ if 'messages' not in st.session_state:
     st.session_state.messages = []
 # --- Sidebar Framework ---
 with st.sidebar:
+
+    st.title("⚙️ Agent Settings")
+    selected_agent = st.radio(
+        "Select Active Agent:",
+        options=["RAG", "GraphRAG"],
+        horizontal=True,
+        help="Switch between similarity retrieval and multihop, graph retrieval"
+    )
+    if selected_agent == "RAG":   st.toast(st.session_state.app.switch_RAG())
+    else:   st.toast(st.session_state.app.switch_GRAG())
+        
+    
+    st.divider()
+
     st.title("Chat Management")
     
     # 1. Create a New Chat
@@ -58,6 +72,20 @@ with st.sidebar:
             # Rebuild the list of tuples with the updated name for the active thread
             st.toast(rename_session(st.session_state.chat_db, st.session_state.thread_id, new_title))
             st.rerun()
+
+    st.divider()
+    
+    if st.button("🗑️ Delete Current Chat", type="primary", use_container_width=True):
+        # 1. Delete from the database
+        st.toast(delete_sessions(st.session_state.chat_db, st.session_state.thread_id))
+        
+        # 2. Generate a fresh thread to replace the deleted one
+        st.session_state.thread_id = str(uuid.uuid4())
+        add_session(st.session_state.chat_db, st.session_state.thread_id)
+        
+        # 3. Clear the screen messages
+        st.session_state.messages = []
+        st.rerun()
 
     st.divider()
 

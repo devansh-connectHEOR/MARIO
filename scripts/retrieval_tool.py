@@ -1,6 +1,6 @@
 from langchain_core.tools import BaseTool, ToolException
 from langchain_core.retrievers import BaseRetriever
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
 from typing import Type, Any
@@ -8,8 +8,12 @@ from typing import Type, Any
 from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_openai import ChatOpenAI
+from langchain_openai import OpenAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 import asyncio
+
+from langchain_community.vectorstores import Neo4jVector
+
 
 precise_retrieval_desctiption = """
 A high-precision technical retrieval tool optimized for HEOR and NICE Technical Support Documents (TSD). 
@@ -39,7 +43,24 @@ rather than specific (e.g., 'What is the formula in TSD 14?').
 It is engineered to prioritize 'theme-matching' over 'exact-word-matching.'
 """
 
-class retrieval_tool(BaseTool):
+graph_retrieval_query = """
+// 1. Find the original Document chunk that mentions our matched node
+MATCH (node)<-[:MENTIONS]-(doc:Document)
+
+// 2. Optionally, grab the graph relationships connected to our node (excluding the MENTIONS link)
+OPTIONAL MATCH (node)-[rel]-(neighbor)
+WHERE type(rel) <> 'MENTIONS'
+
+// 3. Bundle the relationships together
+WITH doc, node, score, collect(node.id + ' ' + type(rel) + ' ' + neighbor.id) AS relationships
+
+// 4. Return the rich chunk text AND the structural relationships back to the LLM!
+RETURN "Original Source Text:\n" + doc.text + "\n\nExtracted Relationships:\n" + reduce(s="", r in relationships | s + r + '\n') AS text, 
+       score, 
+       {} AS metadata
+"""
+
+class vector_retrieval_tool(BaseTool):
 
     name: str 
     description: str 
@@ -48,6 +69,22 @@ class retrieval_tool(BaseTool):
     documents: list[Document]
     images: dict[str, str]
     vectorstore: Any
+
+    _bm25_cache: dict = PrivateAttr(default_factory=dict)
+    _doc_type_llm: Any = PrivateAttr()
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._bm25_cache[None] = BM25Retriever.from_documents(self.documents, k=self.k)
+        # Pre-build for each doc_type
+        doc_types = ['TSD', "TA"] # TAs not yet added
+        for dt in doc_types:
+            filtered = [d for d in self.documents if d.metadata.get("doc_type") == dt]
+            if not filtered:
+                print(f"Warning: No documents found for doc_type='{dt}', skipping BM25 index.")
+                continue
+            self._bm25_cache[dt] = BM25Retriever.from_documents(filtered, k=self.k)
+        self._doc_type_llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0.3).with_structured_output(self.doc_type)
 
 
     def create_context(self, docs: list[Document]) -> list[dict]:
@@ -95,18 +132,13 @@ class retrieval_tool(BaseTool):
         
         retriever = self.vectorstore.as_retriever(search_kwargs={"k": self.k})
 
-        doc_type_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3).with_structured_output(self.doc_type)
-        doc_type = doc_type_llm.invoke(query)
+        doc_type = self._doc_type_llm.invoke(query)
         doc_type = doc_type.doc_type if doc_type.doc_type != "Both" else None
-        documents = self.documents
-        #print(f"Determined doc_type for retrieval: {doc_type}")
+        bm25 = self._bm25_cache.get(doc_type)
+
         if doc_type:
             retriever.search_kwargs["filter"] = {"doc_type": doc_type}
-            documents = [d for d in documents if d.metadata.get("doc_type") == doc_type]
-            #print(len(documents))
-        bm25 = BM25Retriever.from_documents(documents, k = self.k)
-        
-        #print(len(bm25.invoke(query)), len(retriever.invoke(query)))
+
         
         ensemble_retriever = EnsembleRetriever(
             retrievers=[retriever, bm25],
@@ -119,7 +151,55 @@ class retrieval_tool(BaseTool):
         stop_idx = text_indices[self.k] if len(text_indices) > self.k else len(rrf_docs)
         retrieved_docs = rrf_docs[:stop_idx]
         
-        #print(len(retrieved_docs))
         context = self.create_context(retrieved_docs)
+
         return context
+    
+    async def _arun(self, query: str) -> list[dict]:
+        """Asynchronous execution for LangGraph/LangChain compatibility."""
+        retriever = self.vectorstore.as_retriever(search_kwargs={"k": self.k})
+
+        doc_type_res = await self._doc_type_llm.ainvoke(query)
+        doc_type = doc_type_res.doc_type if doc_type_res.doc_type != "Both" else None
+
+        if doc_type:
+            retriever.search_kwargs["filter"] = {"doc_type": doc_type}
+
+        bm25 = self._bm25_cache.get(doc_type)
         
+        ensemble_retriever = EnsembleRetriever(
+            retrievers=[retriever, bm25],
+            weights=[1.0 - self.bm25_weight, self.bm25_weight],
+        )
+        
+        rrf_docs = await ensemble_retriever.ainvoke(query)
+        
+        text_indices = [idx for idx, d in enumerate(rrf_docs) if d.metadata.get('type') == 'text']
+        stop_idx = text_indices[self.k] if len(text_indices) > self.k else len(rrf_docs)
+        retrieved_docs = rrf_docs[:stop_idx]
+        
+        return self.create_context(retrieved_docs)
+
+class graph_retrieval_tool(BaseTool):
+
+    name: str = "graph_retrieval_tool"
+    description: str = "A tool to retrieve context information and cross document relationships"
+    _embeddings: Any = PrivateAttr(default=None)
+    _graph_retriever: Any = PrivateAttr(default=None)
+
+    @property
+    def graph_retriever(self):
+        if self._graph_retriever is None:
+            self._embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+            self._graph_retriever = Neo4jVector.from_existing_index(
+                embedding=self._embeddings,
+                index_name="vector",
+                retrieval_query=graph_retrieval_query
+            ).as_retriever(search_kwargs={"k": 5})
+        return self._graph_retriever
+    
+    def _run(self, query: str) -> str:
+        return self._graph_retriever.invoke(query)
+    
+    async def _arun(self, query: str) -> Any:
+        return await self._graph_retriever.ainvoke(query)
