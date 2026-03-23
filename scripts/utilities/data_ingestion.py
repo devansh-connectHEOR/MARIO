@@ -10,6 +10,8 @@ Pipeline overview:
                  saving both to disk alongside a metadata index.
     3. Load:     Read the saved Markdown and image files back as LangChain Documents,
                  optionally splitting text chunks with a TextSplitter.
+    4. Export:   Push loaded Documents into a PGVector store or write them as
+                 plain text files for a knowledge graph pipeline.
 
 Environment:
     HF_HUB_DISABLE_SYMLINKS=1 is set at import time to avoid symlink errors
@@ -18,10 +20,9 @@ Environment:
 
 from pathlib import Path
 import os
-from tqdm import tqdm
 import re
 import base64
-import scripts.utilities.data_ingestion as di
+from tqdm import tqdm
 
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"  # Required on managed laptops that restrict symlinks
 
@@ -33,6 +34,8 @@ from docling.document_converter import PdfFormatOption
 import fitz
 from langchain_core.documents import Document
 from langchain_text_splitters.base import TextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_postgres.vectorstores import PGVector
 
 
 # --- Docling Pipeline Configuration ---
@@ -96,7 +99,7 @@ def read_documents_from_list(
         if entry.is_file():
             d = fitz.open(entry)
             meta = d.metadata
-            metadata = f"{meta['title']} | {meta['author']} | TSD" # type: ignore
+            metadata = f"{meta['title']} | {meta['author']} | TSD"  # type: ignore
             dox.append((converter.convert(entry), metadata))
 
     print(f"Read {len(dox)} documents.")
@@ -263,7 +266,7 @@ def load_data(
 
             docs = splitter.split_text(content) if splitter else [Document(content)]
             for doc in docs:
-                doc.metadata.update(metadata[mkd.stem]) 
+                doc.metadata.update(metadata[mkd.stem])
             mkd_docs += docs
 
     if images_path:
@@ -293,8 +296,54 @@ def load_data(
     return mkd_docs, img_docs, imgs
 
 
+# --- Vectorstore ---
 
-# --- Export ---
+def docs_to_pgvector(
+    documents: list[Document],
+    db_uri: str,
+    embeddings: OpenAIEmbeddings,
+    collection_name: str,
+    reset_collection: bool = False
+) -> PGVector:
+    """
+    Embed and upsert a list of LangChain Documents into a PGVector collection.
+
+    By default, documents are added to (or updated in) an existing collection.
+    Set `reset_collection=True` to wipe the collection and rebuild it from scratch —
+    useful during initial ingestion or when re-indexing after structural changes.
+
+    Args:
+        documents (list[Document]):    LangChain Documents to embed and store.
+        db_uri (str):                  PostgreSQL connection URI,
+                                       e.g. "postgresql+psycopg://user:pass@host:port/db".
+        embeddings (OpenAIEmbeddings): Embeddings model used to vectorize document content.
+        collection_name (str):         Name of the PGVector collection to write to.
+        reset_collection (bool):       If True, delete and recreate the collection before
+                                       inserting. Defaults to False (upsert into existing).
+
+    Returns:
+        PGVector: The populated vectorstore instance, ready for similarity search.
+    """
+    vectorstore = PGVector(
+        embeddings=embeddings,
+        collection_name=collection_name,
+        connection=db_uri,
+        use_jsonb=True,
+    )
+
+    if reset_collection:
+        vectorstore.delete_collection()
+        vectorstore.create_collection()
+
+    vectorstore.add_documents(documents)
+    print(
+        f"{'Reset and indexed' if reset_collection else 'Upserted'} "
+        f"{len(documents)} documents into collection '{collection_name}'."
+    )
+    return vectorstore
+
+
+# --- Knowledge Graph Export ---
 
 def documents_to_kg_text(documents: list[Document], output_dir: Path) -> None:
     """
@@ -314,12 +363,12 @@ def documents_to_kg_text(documents: list[Document], output_dir: Path) -> None:
     """
     for i, doc in enumerate(documents):
         if doc.metadata.get("title"):
-            # Text document
+            # Text document: include full metadata and page content
             name = doc.metadata["title"]
             header = str(doc.metadata)
             body = "Page Content:\n" + str(doc.page_content)
         else:
-            # Image document
+            # Image document: include figure provenance and caption
             name = doc.metadata.get("document", f"unknown_{i}")
             page = doc.metadata.get('page_no')
             header = f"Figure from {name}, Page: {page}"
@@ -329,4 +378,4 @@ def documents_to_kg_text(documents: list[Document], output_dir: Path) -> None:
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(header + "\n" + body)
 
-    print("Export complete.")
+    print(f"Exported {len(documents)} documents to '{output_dir}'.")

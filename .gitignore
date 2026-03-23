@@ -10,3 +10,4 @@ chroma*
 *.db-shm
 *.db-wal
 *.json
+/output

@@ -82,6 +82,11 @@ RETURN
     {} AS metadata
 """
 
+class DocTypeClassification(BaseModel):
+    """Structured output schema for doc_type classification."""
+    doc_type: str = Field(
+        description="Whether the documents required are 'TSD' (Technical Support Document), 'TA' (Technical Assessment), or Both."
+    )
 
 class VectorRetrievalTool(BaseTool):
     """
@@ -135,15 +140,9 @@ class VectorRetrievalTool(BaseTool):
 
         # Small LLM used to classify queries as TSD, TA, or Both
         self._doc_type_llm = ChatOpenAI(
-            model="gpt-4.1-mini", temperature=0.3
-        ).with_structured_output(self._DocType)
+            model="gpt-4.1-mini", temperature=0
+        ).bind_tools([DocTypeClassification], tool_choice="any")
 
-    class _DocType(BaseModel):
-        """Structured output schema for doc_type classification."""
-        doc_type: str = Field(
-            description="Whether the documents required are TSD (Technical Support Document), "
-                        "TA (Technical Assessment), or Both."
-        )
 
     def create_context(self, docs: list[Document]) -> list[dict]:
         """
@@ -216,8 +215,15 @@ class VectorRetrievalTool(BaseTool):
 
         retriever = self.vectorstore.as_retriever(search_kwargs={"k": self.k})
 
-        doc_type_res = self._doc_type_llm.invoke(query)
-        doc_type = doc_type_res.doc_type if doc_type_res.doc_type != "Both" else None
+        response = self._doc_type_llm.invoke(query)
+ 
+        if response.tool_calls:
+            extracted_args = response.tool_calls[0].get("args", {})
+            doc_type_val = extracted_args.get("doc_type", "Both")
+        else:
+            doc_type_val = "Both"
+
+        doc_type = doc_type_val if doc_type_val != "Both" else None
 
         if doc_type:
             retriever.search_kwargs["filter"] = {"doc_type": {"$eq": doc_type}}
@@ -245,8 +251,15 @@ class VectorRetrievalTool(BaseTool):
         """
         retriever = self.vectorstore.as_retriever(search_kwargs={"k": self.k})
 
-        doc_type_res = await self._doc_type_llm.ainvoke(query)
-        doc_type = doc_type_res.doc_type if doc_type_res.doc_type != "Both" else None
+        response = await self._doc_type_llm.ainvoke(query)
+        
+        if response.tool_calls:
+            extracted_args = response.tool_calls[0].get("args", {})
+            doc_type_val = extracted_args.get("doc_type", "Both")
+        else:
+            doc_type_val = "Both"
+
+        doc_type = doc_type_val if doc_type_val != "Both" else None
 
         if doc_type:
             retriever.search_kwargs["filter"] = {"doc_type": doc_type}

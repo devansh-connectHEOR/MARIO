@@ -29,7 +29,7 @@ Usage:
     response = await rag.a_analyze("What is the prior for heterogeneity in TSD 2?")
 """
 
-import scripts.utilities.data_ingestion as di
+from scripts.utilities.data_ingestion import load_data
 import scripts.retrieval_tool as rt
 from scripts.image_llm import ImageLLM
 
@@ -37,7 +37,8 @@ from langchain_core.documents import Document
 from langchain_text_splitters.base import TextSplitter
 from langchain_text_splitters import MarkdownHeaderTextSplitter
 from langchain_openai import OpenAIEmbeddings
-from langchain_chroma import Chroma
+from langchain_postgres.vectorstores import PGVector
+from sqlalchemy.ext.asyncio import create_async_engine
 from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 import langchain.agents
@@ -247,6 +248,7 @@ class RAG:
 
     def __init__(
         self,
+        DB_URI : str,
         pdf_docs_dir: Path | None,
         working_dir_path: Path | None = None,
         llm_model: str = "gpt-4.1-mini",
@@ -267,6 +269,8 @@ class RAG:
         self.splitter = splitter
         self.checkpointer = checkpointer
         self.system_prompt = system_prompt
+        self.DB_URI = DB_URI
+        async_engine = create_async_engine(self.DB_URI)
 
         self.images: dict[str, str] = {}
         self.mkd_docs: list[Document] = []
@@ -281,18 +285,13 @@ class RAG:
             )
         ]
 
-        # Set up working directory and load documents
-        if not self.cwd.is_dir():
-            self.cwd.mkdir(parents=True)
-            (self.cwd / "vectorstore").mkdir(parents=False)
-        else:
-            self.setup_from_working_dir()
+        self.setup_from_working_dir()
 
-        # Vectorstore (persisted to disk)
-        self.vectorstore = Chroma(
-            collection_name="tsd_vector_store",
-            embedding_function=self.embeddings,
-            persist_directory=str(self.cwd / "vectorstore"),
+        # Vectorstore
+        self.vectorstore = PGVector(
+            embeddings=self.embeddings,
+            collection_name="TSDs",
+            connection=async_engine,
         )
 
         # Retrieval tools
@@ -416,7 +415,7 @@ class RAG:
                 "'markdown_files' and 'image_files' subdirectories."
             )
 
-        mkd_docs, img_docs, imgs = di.load_data(mkd_path, img_path, self.splitter)
+        mkd_docs, img_docs, imgs = load_data(mkd_path, img_path, self.splitter)
 
         self.images.update(imgs)
         self.mkd_docs.extend(mkd_docs)
@@ -453,7 +452,7 @@ class RAG:
                     "content": msg.content,
                 }
                 for msg in messages
-                if not isinstance(msg, ToolMessage)
+                if (not isinstance(msg, ToolMessage)) and (msg.content != '')
             ]
         except KeyError:
             return []
