@@ -1,28 +1,57 @@
+"""
+scripts/RAG.py
+
+Implements the RAG class — the main entry point for the NICE TSD Expert Agent.
+
+Two retrieval modes are supported and can be switched at runtime:
+
+    RAG mode (default):
+        Uses a hybrid BM25 + vector EnsembleRetriever via two VectorRetrievalTool
+        instances — one precision-weighted (70% BM25) and one semantics-weighted
+        (70% vector) — for needle-in-a-haystack vs. bird's-eye-view queries.
+
+    GRAG mode (Graph RAG):
+        Replaces the vector tools with a single GraphRetrievalTool backed by a
+        Neo4j knowledge graph, returning entity relationships alongside source
+        text for cross-document relational queries.
+
+The agent is a LangGraph agent with optional conversation summarization
+middleware to manage context window size across long threads.
+
+Usage:
+    # From raw PDFs
+    rag = RAG(pdf_docs_dir=Path("pdfs/"), working_dir_path=Path("rag_wd/"))
+
+    # From a previously built working directory
+    rag = RAG(pdf_docs_dir=None, working_dir_path=Path("rag_wd/"))
+
+    # Invoke
+    response = await rag.a_analyze("What is the prior for heterogeneity in TSD 2?")
+"""
+
 import scripts.utilities.data_ingestion as di
 import scripts.retrieval_tool as rt
-from scripts.image_llm import image_llm
+from scripts.image_llm import ImageLLM
 
 from langchain_core.documents import Document
 from langchain_text_splitters.base import TextSplitter
-from docling.document_converter import DocumentConverter
-import pydantic
+from langchain_text_splitters import MarkdownHeaderTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_chroma import Chroma
+from langchain_core.messages import HumanMessage, ToolMessage
+from langgraph.checkpoint.memory import InMemorySaver
+import langchain.agents
+from langchain.agents.middleware import SummarizationMiddleware
 from pathlib import Path
 
-from langchain_text_splitters import MarkdownHeaderTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_chroma import Chroma
-from langchain_classic.retrievers import EnsembleRetriever
-from langchain_community.retrievers import BM25Retriever
-import langchain.agents
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from langchain.messages import HumanMessage, ToolMessage
-from langchain.agents.middleware import SummarizationMiddleware
 
+# ---------------------------------------------------------------------------
+# System prompts
+# ---------------------------------------------------------------------------
 
 default_system_prompt = """
 ### ROLE
-You are the NICE TSD Expert Teacher Agent, a specialized clinical librarian assistant adn explainer. Your purpose is to provide new professionals with precise, audit-ready, evidence-based answers derived strictly from NICE Technical Support Documents (TSDs). 
+You are the NICE TSD Expert Teacher Agent, a specialized clinical librarian assistant and explainer. Your purpose is to provide new professionals with precise, audit-ready, evidence-based answers derived strictly from NICE Technical Support Documents (TSDs).
 
 ### OPERATIONAL FRAMEWORK
 
@@ -157,191 +186,348 @@ The relationship between uncertainty and cost-effectiveness is bridged by the re
 - **Relationship (if applicable):** [How Entity A connects to Entity B] — *Source: [Doc Name, Page # or Link Type]*
 """
 
+# Default text splitter: splits Markdown by header hierarchy into structured chunks
+_DEFAULT_SPLITTER = MarkdownHeaderTextSplitter(
+    headers_to_split_on=[
+        ("#", "Header 1"),
+        ("##", "Header 2"),
+        ("###", "Header 3"),
+    ]
+)
+
+# Default summarization middleware config for managing long conversation threads
+_SUMMARIZATION_MIDDLEWARE_PROMPT = (
+    "You are a helpful assistant that summarizes conversation history to save tokens "
+    "while retaining important information. Summarize previous messages concisely, "
+    "focusing on key points relevant to ongoing discussion about the NICE TSDs. "
+    "Omit any redundant or less important details. In case of images, keep their "
+    "caption or a simple relevant summary of it."
+)
+
+
+# ---------------------------------------------------------------------------
+# RAG class
+# ---------------------------------------------------------------------------
 
 class RAG:
+    """
+    Main entry point for the NICE TSD Expert RAG agent.
+
+    Manages document ingestion, vectorstore setup, retrieval tool configuration,
+    and the LangGraph agent. Supports two retrieval modes (RAG and GRAG) that
+    can be switched at runtime via `switch_RAG` and `switch_GRAG`.
+
+    Args:
+        pdf_docs_dir (Path | None):
+            Directory containing source PDF files to ingest. If None,
+            `working_dir_path` must point to an existing working directory
+            with pre-built markdown and image files.
+        working_dir_path (Path | None):
+            Directory for intermediate files (markdown, images, vectorstore).
+            Created automatically if it does not exist. Defaults to
+            `./rag_working_dir` relative to the current working directory.
+        llm_model (str):
+            OpenAI model name for the main agent LLM. Defaults to 'gpt-4.1-mini'.
+        embeddings_model (str):
+            OpenAI embeddings model name. Defaults to 'text-embedding-3-small'.
+        splitter (TextSplitter):
+            LangChain text splitter used to chunk markdown documents.
+            Defaults to a MarkdownHeaderTextSplitter on H1/H2/H3.
+        system_prompt (str):
+            System prompt for the agent. Defaults to `default_system_prompt`
+            (hybrid RAG mode with precise + summarizer tools).
+        checkpointer:
+            LangGraph checkpointer for thread-level memory persistence.
+            Defaults to InMemorySaver().
+
+    Raises:
+        ValueError: If both `pdf_docs_dir` and `working_dir_path` are None.
+        ValueError: If `working_dir_path` exists but is missing required subdirectories.
+    """
+
     def __init__(
-            self, 
-            pdf_docs_dir: Path | None, 
-            working_dir_path: Path | None = None, 
-            llm_model: str = "gpt-4.1", 
-            embeddings_model: str = "text-embedding-3-small", 
-            splitter: TextSplitter = MarkdownHeaderTextSplitter(headers_to_split_on=[("#", "Header 1"), ("##", "Header 2"), ("###", "Header 3")]), 
-            system_prompt: str = default_system_prompt,
-            checkpointer = InMemorySaver()
+        self,
+        pdf_docs_dir: Path | None,
+        working_dir_path: Path | None = None,
+        llm_model: str = "gpt-4.1-mini",
+        embeddings_model: str = "text-embedding-3-small",
+        splitter: TextSplitter = _DEFAULT_SPLITTER,
+        system_prompt: str = default_system_prompt,
+        checkpointer=InMemorySaver(),
     ):
-
-        if pdf_docs_dir or working_dir_path:
-
-            self.source_path = pdf_docs_dir if pdf_docs_dir else None
-            self.cwd = working_dir_path if working_dir_path else Path.cwd() / "rag_working_dir"
-            self.llm = image_llm(model=llm_model, temperature=0.0)
-            self.images = {}
-            self.mkd_docs = []
-            self.img_docs = []
-            self.embeddings = OpenAIEmbeddings(model=embeddings_model)
-            self.splitter = splitter
-            self.checkpointer = checkpointer
-            self.system_prompt = system_prompt
-            self.middleware = [
-                SummarizationMiddleware(
-                    model=image_llm(model = "gpt-4o-mini", temperature=0.0),
-                    trigger=("tokens", 40000),
-                    keep=("messages", 3),
-                    system_prompt="You are a helpful assistant that summarizes conversation history to save tokens while retaining important information. Summarize previous messages concisely, focusing on key points relevant to ongoing discussion about the NICE TSDs. Omit any redundant or less important details. In case of images, keep their caption or a simple relevant summary of it."
-                )
-            ]
-
-            if not self.cwd.is_dir():
-                self.cwd.mkdir(parents=True)
-                vectorstore_path = self.cwd / "vectorstore"
-                vectorstore_path.mkdir(parents=False)
-            
-            else: self.setup_from_working_dir()
-
-            self.vectorstore = Chroma(
-                collection_name="tsd_vector_store",
-                embedding_function=self.embeddings,
-                persist_directory=str(self.cwd / "vectorstore2")
-            )
-            self.precise_retrieval_tool = rt.vector_retrieval_tool(
-                name = "precise_retrieval_tool",
-                description= rt.precise_retrieval_desctiption,
-                documents = self.mkd_docs + self.img_docs,
-                images= self.images,
-                vectorstore= self.vectorstore,
-            )
-            self.summarizer_retrieval_tool = rt.vector_retrieval_tool(
-                name = "summarizer_retrieval_tool",
-                description= rt.summarizer_retrieval_description,
-                bm25_weight=0.3,
-                documents = self.mkd_docs + self.img_docs,
-                images= self.images,
-                k=10,
-                vectorstore= self.vectorstore,
-            )
-            self.graph_retrieval_tool = rt.graph_retrieval_tool()
-
-            self.tools = [self.precise_retrieval_tool, self.summarizer_retrieval_tool]
-
-            self.agent = langchain.agents.create_agent(
-                model=self.llm,
-                tools = self.tools,
-                system_prompt=self.system_prompt,
-                checkpointer=self.checkpointer,
-                middleware=self.middleware
+        if not pdf_docs_dir and not working_dir_path:
+            raise ValueError(
+                "At least one of pdf_docs_dir or working_dir_path must be provided."
             )
 
-        else:
-            raise ValueError("At least one of pdf_docs_path or working_dir_path must be provided.") 
-    
-    def update_agent(self, model:str = "gpt-4.1", system_prompt:str = default_system_prompt) -> str:
-        """
-        For changing the underlying openai model and/or the system prompt
-        args:
-            model
-        """
-        self.llm = image_llm(model=model, temperature=0.0)
+        self.source_path = pdf_docs_dir
+        self.cwd = working_dir_path or Path.cwd() / "rag_working_dir"
+        self.llm = ImageLLM(model=llm_model, temperature=0.0)
+        self.embeddings = OpenAIEmbeddings(model=embeddings_model)
+        self.splitter = splitter
+        self.checkpointer = checkpointer
         self.system_prompt = system_prompt
-        
-        self.agent = langchain.agents.create_agent(
-            model=self.llm,
-            tools = self.tools,
-            system_prompt=self.system_prompt,
-            checkpointer=self.checkpointer,
-            middleware=self.middleware
+
+        self.images: dict[str, str] = {}
+        self.mkd_docs: list[Document] = []
+        self.img_docs: list[Document] = []
+
+        self.middleware = [
+            SummarizationMiddleware(
+                model=ImageLLM(model="gpt-4o-mini", temperature=0.0),
+                trigger=("tokens", 40000),
+                keep=("messages", 3),
+                system_prompt=_SUMMARIZATION_MIDDLEWARE_PROMPT,
+            )
+        ]
+
+        # Set up working directory and load documents
+        if not self.cwd.is_dir():
+            self.cwd.mkdir(parents=True)
+            (self.cwd / "vectorstore").mkdir(parents=False)
+        else:
+            self.setup_from_working_dir()
+
+        # Vectorstore (persisted to disk)
+        self.vectorstore = Chroma(
+            collection_name="tsd_vector_store",
+            embedding_function=self.embeddings,
+            persist_directory=str(self.cwd / "vectorstore"),
         )
 
-        return "Agent updated!"
+        # Retrieval tools
+        all_docs = self.mkd_docs + self.img_docs
+        self.precise_retrieval_tool = rt.VectorRetrievalTool(
+            name="precise_retrieval_tool",
+            description=rt.precise_retrieval_description,
+            documents=all_docs,
+            images=self.images,
+            vectorstore=self.vectorstore,
+        )
+        self.summarizer_retrieval_tool = rt.VectorRetrievalTool(
+            name="summarizer_retrieval_tool",
+            description=rt.summarizer_retrieval_description,
+            bm25_weight=0.3,
+            documents=all_docs,
+            images=self.images,
+            k=10,
+            vectorstore=self.vectorstore,
+        )
+        self.graph_retrieval_tool = rt.GraphRetrievalTool()
 
-    def switch_RAG(self, system_prompt = default_system_prompt):
+        # Default to RAG mode (hybrid vector tools)
+        self.tools = [self.precise_retrieval_tool, self.summarizer_retrieval_tool]
+        self.agent = self._build_agent()
+
+    # ---------------------------------------------------------------------------
+    # Agent lifecycle
+    # ---------------------------------------------------------------------------
+
+    def _build_agent(self):
+        """
+        Instantiate a LangGraph agent with the current LLM, tools, system prompt,
+        checkpointer, and middleware.
+
+        Called internally whenever any of these components change.
+
+        Returns:
+            A LangGraph agent ready to invoke.
+        """
+        return langchain.agents.create_agent(
+            model=self.llm,
+            tools=self.tools,
+            system_prompt=self.system_prompt,
+            checkpointer=self.checkpointer,
+            middleware=self.middleware,
+        )
+
+    def update_agent(self, model: str = "gpt-4.1", system_prompt: str = default_system_prompt) -> str:
+        """
+        Swap the underlying LLM model and/or system prompt and rebuild the agent.
+
+        Args:
+            model (str): OpenAI model name to switch to. Defaults to 'gpt-4.1'.
+            system_prompt (str): New system prompt. Defaults to `default_system_prompt`.
+
+        Returns:
+            str: Confirmation message.
+        """
+        self.llm = ImageLLM(model=model, temperature=0.0)
+        self.system_prompt = system_prompt
+        self.agent = self._build_agent()
+        return "Agent updated."
+
+    def switch_RAG(self, system_prompt: str = default_system_prompt) -> str:
+        """
+        Switch to RAG mode: hybrid vector retrieval with precise + summarizer tools.
+
+        Args:
+            system_prompt (str): System prompt to use. Defaults to `default_system_prompt`.
+
+        Returns:
+            str: Confirmation message.
+        """
         self.system_prompt = system_prompt
         self.tools = [self.precise_retrieval_tool, self.summarizer_retrieval_tool]
-        self.agent = langchain.agents.create_agent(
-            model=self.llm,
-            tools = self.tools,
-            system_prompt=self.system_prompt,
-            checkpointer=self.checkpointer,
-            middleware=self.middleware
-        )
+        self.agent = self._build_agent()
+        return "Switched to RAG mode."
 
-        return "RAG setup complete"
-        
-    def switch_GRAG(self, system_prompt = grag_system_prompt):
+    def switch_GRAG(self, system_prompt: str = grag_system_prompt) -> str:
+        """
+        Switch to GRAG mode: graph-augmented retrieval via Neo4j knowledge graph.
+
+        Args:
+            system_prompt (str): System prompt to use. Defaults to `grag_system_prompt`.
+
+        Returns:
+            str: Confirmation message.
+        """
         self.system_prompt = system_prompt
         self.tools = [self.graph_retrieval_tool]
-        self.agent = langchain.agents.create_agent(
-            model=self.llm,
-            tools = self.tools,
-            system_prompt=self.system_prompt,
-            checkpointer=self.checkpointer,
-            middleware=self.middleware
-        )
+        self.agent = self._build_agent()
+        return "Switched to GRAG mode."
 
-        return "GRAG setup complete"    
-   
-    def setup_from_working_dir(self):
+    # ---------------------------------------------------------------------------
+    # Document loading
+    # ---------------------------------------------------------------------------
+
+    def setup_from_working_dir(self) -> str:
+        """
+        Load pre-processed documents and images from an existing working directory.
+
+        Expects the working directory to contain:
+            - markdown_files/  — markdown documents
+            - image_files/     — extracted page images
+
+        Updates `self.images`, `self.mkd_docs`, and `self.img_docs` in place.
+
+        Returns:
+            str: Confirmation message.
+
+        Raises:
+            ValueError: If required subdirectories are missing.
+        """
         mkd_path = self.cwd / "markdown_files"
         img_path = self.cwd / "image_files"
 
         if not mkd_path.is_dir() or not img_path.is_dir():
-            raise ValueError("Working directory must contain 'markdown_files' and 'image_files' subdirectories.")
+            raise ValueError(
+                f"Working directory '{self.cwd}' must contain "
+                "'markdown_files' and 'image_files' subdirectories."
+            )
 
         mkd_docs, img_docs, imgs = di.load_data(mkd_path, img_path, self.splitter)
-        
+
         self.images.update(imgs)
         self.mkd_docs.extend(mkd_docs)
         self.img_docs.extend(img_docs)
 
-        return "Documents and images loaded"
-        
-    def get_msg_history(self, thread_id='default_thread'):
+        return f"Loaded {len(mkd_docs)} text chunks and {len(img_docs)} image docs."
+
+    # ---------------------------------------------------------------------------
+    # Conversation history
+    # ---------------------------------------------------------------------------
+
+    async def get_msg_history(self, thread_id: str = "default_thread") -> list[dict]:
+        """
+        Retrieve the human/assistant message history for a given thread.
+
+        Filters out ToolMessages (internal retrieval results) and returns only
+        the user-facing conversation turns.
+
+        Args:
+            thread_id (str): The LangGraph thread identifier. Defaults to 'default_thread'.
+
+        Returns:
+            list[dict]: A list of {"role": "user"|"assistant", "content": ...} dicts.
+                        Returns an empty list if no history exists for the thread.
+        """
         try:
-            msgs = self.agent.get_state(config = {"configurable": {"thread_id":thread_id}}).values['messages']
-            msgs = [i for i in msgs if not isinstance(i, ToolMessage)]
-            msgs = [
-            {"role":"user" if isinstance(i, HumanMessage) else "assistant", "content": i.content} for i in msgs
+            state = await self.agent.aget_state(
+                config={"configurable": {"thread_id": thread_id}}
+            )
+            messages = state.values["messages"]
+            return [
+                {
+                    "role": "user" if isinstance(msg, HumanMessage) else "assistant",
+                    "content": msg.content,
+                }
+                for msg in messages
+                if not isinstance(msg, ToolMessage)
             ]
         except KeyError:
-            msgs = []
-        return msgs
+            return []
 
-    def analyze(self, query:str, thread_id='default_thread'):
-        response = self.agent.invoke(
-            {"messages": [HumanMessage(content=query)]},
-            {"configurable": {"thread_id": thread_id}}
-        )
-        return response
-    
-    async def a_analyze(self, query: str, thread_id='default_thread'):
-        response = await self.agent.ainvoke(
-            {"messages": [HumanMessage(content=query)]},
-            {"configurable": {"thread_id": thread_id}}
-        )
-        return response
-    
-    def analyze_stream(self, user_message, thread_id='default_thread'):
+    # ---------------------------------------------------------------------------
+    # Invocation
+    # ---------------------------------------------------------------------------
+
+    def analyze(self, query: str, thread_id: str = "default_thread") -> dict:
         """
-        Analyzes the user's message using the agent in a streaming manner.
+        Synchronously invoke the agent with a user query.
+
         Args:
-            user_message: The message from the user to be analyzed.
-            thread_id: The thread ID for maintaining conversation context.
+            query (str): The user's question.
+            thread_id (str): Thread identifier for conversation memory.
+
+        Returns:
+            dict: The full agent response dictionary from LangGraph.
         """
-        for token, metadata in self.agent.stream(
+        return self.agent.invoke(
+            {"messages": [HumanMessage(content=query)]},
+            {"configurable": {"thread_id": thread_id}},
+        )
+
+    async def a_analyze(self, query: str, thread_id: str = "default_thread") -> dict:
+        """
+        Asynchronously invoke the agent with a user query.
+
+        Args:
+            query (str): The user's question.
+            thread_id (str): Thread identifier for conversation memory.
+
+        Returns:
+            dict: The full agent response dictionary from LangGraph.
+        """
+        return await self.agent.ainvoke(
+            {"messages": [HumanMessage(content=query)]},
+            {"configurable": {"thread_id": thread_id}},
+        )
+
+    def analyze_stream(self, user_message: str, thread_id: str = "default_thread"):
+        """
+        Synchronously stream the agent's response token by token.
+
+        Args:
+            user_message (str): The user's question.
+            thread_id (str): Thread identifier for conversation memory.
+
+        Yields:
+            str: Individual content tokens as they are generated.
+        """
+        for token, _ in self.agent.stream(
             {"messages": [HumanMessage(content=user_message)]},
             {"configurable": {"thread_id": thread_id}},
-            stream_mode="messages"
+            stream_mode="messages",
         ):
             if token.content:
                 yield token.content
 
-    async def a_analyze_stream(self, user_message, thread_id='default_thread'):
+    async def a_analyze_stream(self, user_message: str, thread_id: str = "default_thread"):
         """
-        Analyzes the user's message using the agent in an asynchronous streaming manner.
+        Asynchronously stream the agent's response token by token.
+
+        Args:
+            user_message (str): The user's question.
+            thread_id (str): Thread identifier for conversation memory.
+
+        Yields:
+            str: Individual content tokens as they are generated.
         """
-        async for token, metadata in self.agent.astream(
+        async for token, _ in self.agent.astream(
             {"messages": [HumanMessage(content=user_message)]},
             {"configurable": {"thread_id": thread_id}},
-            stream_mode="messages"
+            stream_mode="messages",
         ):
             if token.content:
                 yield token.content
